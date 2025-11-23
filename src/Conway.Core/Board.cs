@@ -2,6 +2,8 @@
 // Date: 23 November 2025
 // Notes: C# port of the Python TDD kata for Conway's Game of Life
 
+using System.Diagnostics;
+
 namespace Conway.Core;
 
 /// <summary>
@@ -36,6 +38,10 @@ public class Board : IEquatable<Board>
 
     public Board Tick()
     {
+        using var activity = Telemetry.ActivitySource.StartActivity("Board.Tick");
+        activity?.SetTag("board.current_generation", _generation);
+        activity?.SetTag("board.size", $"{_size.rows}x{_size.cols}");
+
         var nextBoard = new List<Row>();
         for (int i = 0; i < _rows.Count; i++)
         {
@@ -47,6 +53,9 @@ public class Board : IEquatable<Board>
             nextBoard.Add(new Row(rowCells));
         }
 
+        int liveCellsProcessed = 0;
+        int deadCellsProcessed = 0;
+
         for (int row = 0; row < _rows.Count; row++)
         {
             for (int col = 0; col < _cols; col++)
@@ -54,6 +63,7 @@ public class Board : IEquatable<Board>
                 var cell = _rows[row][col];
                 if (cell == '*')
                 {
+                    liveCellsProcessed++;
                     var liveNeighbourCount = new Neighbours(row, col, _size).GetCount(_rows);
                     if (liveNeighbourCount == 2 || liveNeighbourCount == 3)
                     {
@@ -62,6 +72,7 @@ public class Board : IEquatable<Board>
                 }
                 else
                 {
+                    deadCellsProcessed++;
                     var liveNeighbourCount = new Neighbours(row, col, _size).GetCount(_rows);
                     if (liveNeighbourCount == 3)
                     {
@@ -71,9 +82,15 @@ public class Board : IEquatable<Board>
             }
         }
 
-        var grid = BoardToGrid(nextBoard);
+        activity?.SetTag("board.live_cells_processed", liveCellsProcessed);
+        activity?.SetTag("board.dead_cells_processed", deadCellsProcessed);
 
-        return new Board(_generation + 1, _size, grid);
+        var grid = BoardToGrid(nextBoard);
+        var newBoard = new Board(_generation + 1, _size, grid);
+
+        activity?.SetTag("board.next_generation", _generation + 1);
+
+        return newBoard;
     }
 
     private char[,] BoardToGrid(List<Row> nextBoard)

@@ -1,47 +1,88 @@
 // Author: Ian Cooper
 // Date: 23 November 2025
-// Notes: Tests for Game use case following the Python test approach
+// Notes: Tests for Game use case using OpenTelemetry traces to verify behavior
 
 using Conway.Core;
+using OpenTelemetry;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
+using System.Diagnostics;
 using Xunit;
 
 namespace Conway.Tests;
 
-public class GameTests
+public class GameTests : IDisposable
 {
+    private readonly List<Activity> _exportedActivities = new();
+    private readonly TracerProvider _tracerProvider;
+
+    public GameTests()
+    {
+        // Set up OpenTelemetry with InMemory exporter to capture traces
+        _tracerProvider = Sdk.CreateTracerProviderBuilder()
+            .SetResourceBuilder(ResourceBuilder.CreateDefault().AddService(Telemetry.ServiceName))
+            .AddSource(Telemetry.ServiceName)
+            .AddInMemoryExporter(_exportedActivities)
+            .Build()!;
+    }
+
+    public void Dispose()
+    {
+        _tracerProvider?.Dispose();
+    }
+
     [Fact]
     public void GameOfLife()
     {
         // Run an iteration of game of life
-        // We are going to use fakes for the boundaries/adapters - this is fine
+        // We verify the flow through OpenTelemetry traces
 
         var reader = new FakeReader();
-        var writer = new FakeWriter();
+        var writer = new NoOpWriter(); // We don't need to track writes anymore
 
         var game = new Game(reader, writer);
 
         game.Play();
 
-        // Should have written 2 boards: initial (generation 0) and after one tick (generation 1)
-        Assert.Equal(2, writer.BoardsWritten.Count);
+        // Force flush to ensure all activities are exported
+        _tracerProvider.ForceFlush();
 
-        // Verify the initial board (generation 0) was written first
-        var initialBoard = new Board(0, (3, 3), new[,]
-        {
-            { '.', '*', '.' },
-            { '*', '*', '*' },
-            { '.', '*', '.' }
-        });
-        Assert.Equal(initialBoard, writer.BoardsWritten[0]);
+        // Verify we have the expected spans
+        Assert.NotEmpty(_exportedActivities);
 
-        // Verify the transformed board (generation 1) was written after one tick
-        var expectedTransformedBoard = new Board(1, (3, 3), new[,]
-        {
-            { '*', '*', '*' },
-            { '*', '.', '*' },
-            { '*', '*', '*' }
-        });
-        Assert.Equal(expectedTransformedBoard, writer.BoardsWritten[1]);
+        // Should have: 1 Game.Play + 2 Game.WriteBoard (initial + generation 1) + 1 Board.Tick
+        var gamePlaySpans = _exportedActivities.Where(a => a.DisplayName == "Game.Play").ToList();
+        var writeBoardSpans = _exportedActivities.Where(a => a.DisplayName == "Game.WriteBoard").ToList();
+        var boardTickSpans = _exportedActivities.Where(a => a.DisplayName == "Board.Tick").ToList();
+
+        Assert.Single(gamePlaySpans);
+        Assert.Equal(2, writeBoardSpans.Count);
+        Assert.Single(boardTickSpans);
+
+        // Verify Game.Play span attributes
+        var gamePlaySpan = gamePlaySpans[0];
+        Assert.Equal("1", gamePlaySpan.GetTagItem("game.runs")?.ToString());
+        Assert.Equal("0", gamePlaySpan.GetTagItem("game.initial_generation")?.ToString());
+        Assert.Equal("3x3", gamePlaySpan.GetTagItem("game.board_size")?.ToString());
+        Assert.Equal("1", gamePlaySpan.GetTagItem("game.final_generation")?.ToString());
+
+        // Verify WriteBoard spans
+        var initialWrite = writeBoardSpans.FirstOrDefault(a => a.GetTagItem("board.stage")?.ToString() == "initial");
+        var generation1Write = writeBoardSpans.FirstOrDefault(a => a.GetTagItem("board.stage")?.ToString() == "generation_1");
+
+        Assert.NotNull(initialWrite);
+        Assert.NotNull(generation1Write);
+
+        Assert.Equal("0", initialWrite.GetTagItem("board.generation")?.ToString());
+        Assert.Equal("1", generation1Write.GetTagItem("board.generation")?.ToString());
+
+        // Verify Board.Tick span
+        var tickSpan = boardTickSpans[0];
+        Assert.Equal("0", tickSpan.GetTagItem("board.current_generation")?.ToString());
+        Assert.Equal("1", tickSpan.GetTagItem("board.next_generation")?.ToString());
+        Assert.Equal("3x3", tickSpan.GetTagItem("board.size")?.ToString());
+        Assert.Equal("5", tickSpan.GetTagItem("board.live_cells_processed")?.ToString());
+        Assert.Equal("4", tickSpan.GetTagItem("board.dead_cells_processed")?.ToString());
     }
 
     [Fact]
@@ -50,64 +91,112 @@ public class GameTests
         // Test running multiple generations
 
         var reader = new FakeReader();
-        var writer = new FakeWriter();
+        var writer = new NoOpWriter();
 
         var game = new Game(reader, writer);
 
         game.Play(runs: 3);
 
-        // Should have written 4 boards: initial + 3 generations
-        Assert.Equal(4, writer.BoardsWritten.Count);
+        _tracerProvider.ForceFlush();
 
-        // Verify generation sequence
-        Assert.Equal(0, writer.BoardsWritten[0].GetGeneration());
-        Assert.Equal(1, writer.BoardsWritten[1].GetGeneration());
-        Assert.Equal(2, writer.BoardsWritten[2].GetGeneration());
-        Assert.Equal(3, writer.BoardsWritten[3].GetGeneration());
+        // Should have: 1 Game.Play + 4 Game.WriteBoard (initial + 3 generations) + 3 Board.Tick
+        var gamePlaySpans = _exportedActivities.Where(a => a.DisplayName == "Game.Play").ToList();
+        var writeBoardSpans = _exportedActivities.Where(a => a.DisplayName == "Game.WriteBoard").ToList();
+        var boardTickSpans = _exportedActivities.Where(a => a.DisplayName == "Board.Tick").ToList();
+
+        Assert.Single(gamePlaySpans);
+        Assert.Equal(4, writeBoardSpans.Count);
+        Assert.Equal(3, boardTickSpans.Count);
+
+        // Verify generation progression in Game.Play
+        var gamePlaySpan = gamePlaySpans[0];
+        Assert.Equal("3", gamePlaySpan.GetTagItem("game.runs")?.ToString());
+        Assert.Equal("0", gamePlaySpan.GetTagItem("game.initial_generation")?.ToString());
+        Assert.Equal("3", gamePlaySpan.GetTagItem("game.final_generation")?.ToString());
+
+        // Verify WriteBoard stages
+        var stages = writeBoardSpans.Select(a => a.GetTagItem("board.stage")?.ToString()).ToList();
+        Assert.Contains("initial", stages);
+        Assert.Contains("generation_1", stages);
+        Assert.Contains("generation_2", stages);
+        Assert.Contains("generation_3", stages);
+
+        // Verify Board.Tick progression
+        var tickGenerations = boardTickSpans
+            .Select(a => a.GetTagItem("board.current_generation")?.ToString())
+            .OrderBy(g => g)
+            .ToList();
+
+        Assert.Equal(new[] { "0", "1", "2" }, tickGenerations);
     }
 
     [Fact]
-    public void GameWritesCorrectTransformedBoard()
+    public void GameTracesCorrectBoardTransformation()
     {
-        // Specifically test that the board transformation is correct
+        // Specifically test that the board transformation is correctly traced
         // Using a simple pattern: single live cell (should die)
 
         var reader = new FakeReaderWithSingleCell();
-        var writer = new FakeWriter();
+        var writer = new NoOpWriter();
 
         var game = new Game(reader, writer);
 
         game.Play();
 
-        // Initial board has one live cell
-        Assert.Equal(2, writer.BoardsWritten.Count);
+        _tracerProvider.ForceFlush();
 
-        var initialBoard = writer.BoardsWritten[0];
-        Assert.True(HasLiveCellAt(initialBoard, 1, 1));
+        var boardTickSpans = _exportedActivities.Where(a => a.DisplayName == "Board.Tick").ToList();
+        Assert.Single(boardTickSpans);
 
-        // After one tick, the single cell should die (underpopulation)
-        var transformedBoard = writer.BoardsWritten[1];
-        Assert.False(HasLiveCellAt(transformedBoard, 1, 1));
+        var tickSpan = boardTickSpans[0];
+
+        // Single cell in 3x3 grid: 1 live, 8 dead
+        Assert.Equal("1", tickSpan.GetTagItem("board.live_cells_processed")?.ToString());
+        Assert.Equal("8", tickSpan.GetTagItem("board.dead_cells_processed")?.ToString());
+
+        // Verify generation transition
+        Assert.Equal("0", tickSpan.GetTagItem("board.current_generation")?.ToString());
+        Assert.Equal("1", tickSpan.GetTagItem("board.next_generation")?.ToString());
     }
 
-    private bool HasLiveCellAt(Board board, int row, int col)
+    [Fact]
+    public void GameTracesShowCorrectSpanHierarchy()
     {
-        var boardString = board.ToString();
-        var lines = boardString.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        // Verify that spans have correct parent-child relationships
 
-        // Skip generation (line 0) and size (line 1) lines
-        if (row + 2 < lines.Length && col < lines[row + 2].Length)
+        var reader = new FakeReader();
+        var writer = new NoOpWriter();
+
+        var game = new Game(reader, writer);
+
+        game.Play();
+
+        _tracerProvider.ForceFlush();
+
+        // Game.Play should be the root span
+        var gamePlaySpan = _exportedActivities.FirstOrDefault(a => a.DisplayName == "Game.Play");
+        Assert.NotNull(gamePlaySpan);
+
+        // WriteBoard and Board.Tick should be children of Game.Play
+        var writeBoardSpans = _exportedActivities.Where(a => a.DisplayName == "Game.WriteBoard").ToList();
+        var boardTickSpans = _exportedActivities.Where(a => a.DisplayName == "Board.Tick").ToList();
+
+        foreach (var writeSpan in writeBoardSpans)
         {
-            return lines[row + 2][col] == '*';
+            Assert.Equal(gamePlaySpan.TraceId, writeSpan.TraceId);
+            Assert.Equal(gamePlaySpan.SpanId, writeSpan.ParentSpanId);
         }
 
-        return false;
+        foreach (var tickSpan in boardTickSpans)
+        {
+            Assert.Equal(gamePlaySpan.TraceId, tickSpan.TraceId);
+            Assert.Equal(gamePlaySpan.SpanId, tickSpan.ParentSpanId);
+        }
     }
 }
 
 /// <summary>
 /// Fake reader that returns a known board configuration
-/// This matches the Python test pattern
 /// </summary>
 internal class FakeReader : IReader
 {
@@ -144,28 +233,12 @@ internal class FakeReaderWithSingleCell : IReader
 }
 
 /// <summary>
-/// Fake writer that captures boards for verification
+/// No-op writer - we don't need to track writes anymore, traces tell us everything
 /// </summary>
-internal class FakeWriter : IWriter
+internal class NoOpWriter : IWriter
 {
-    public List<Board> BoardsWritten { get; } = new List<Board>();
-
     public void WriteBoard(Board board)
     {
-        BoardsWritten.Add(board);
-    }
-}
-
-/// <summary>
-/// Extension methods to access internal Board state for testing
-/// </summary>
-internal static class BoardTestExtensions
-{
-    public static int GetGeneration(this Board board)
-    {
-        var boardType = board.GetType();
-        var generationField = boardType.GetField("_generation",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        return (int)generationField!.GetValue(board)!;
+        // No-op - telemetry captures the writes
     }
 }

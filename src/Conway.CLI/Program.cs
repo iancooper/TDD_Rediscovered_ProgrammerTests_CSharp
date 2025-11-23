@@ -1,8 +1,11 @@
 // Author: Ian Cooper
 // Date: 23 November 2025
-// Notes: CLI for Conway's Game of Life using Clean Architecture
+// Notes: CLI for Conway's Game of Life using Clean Architecture with OpenTelemetry
 
 using Conway.Core;
+using OpenTelemetry;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 using Spectre.Console;
 
 namespace Conway.CLI;
@@ -11,12 +14,20 @@ class Program
 {
     static void Main(string[] args)
     {
+        // Set up OpenTelemetry tracing
+        using var tracerProvider = Sdk.CreateTracerProviderBuilder()
+            .SetResourceBuilder(ResourceBuilder.CreateDefault()
+                .AddService(Telemetry.ServiceName, serviceVersion: Telemetry.ServiceVersion))
+            .AddSource(Telemetry.ServiceName)
+            .AddConsoleExporter()
+            .Build();
+
         AnsiConsole.Write(
             new FigletText("Conway's Game of Life")
                 .LeftJustified()
                 .Color(Color.Green));
 
-        AnsiConsole.MarkupLine("[dim]A C# implementation using TDD and Clean Architecture principles[/]");
+        AnsiConsole.MarkupLine("[dim]A C# implementation using TDD, Clean Architecture, and OpenTelemetry[/]");
         AnsiConsole.WriteLine();
 
         // Get seed file name
@@ -31,8 +42,15 @@ class Program
         // Get number of generations
         var generations = AnsiConsole.Ask("How many [green]generations[/] to run?", 3);
 
+        // Ask if tracing should be enabled
+        var enableTracing = AnsiConsole.Confirm("Enable [yellow]OpenTelemetry trace output[/]?", false);
+
         AnsiConsole.WriteLine();
         AnsiConsole.MarkupLine("[yellow]Starting simulation...[/]");
+        if (enableTracing)
+        {
+            AnsiConsole.MarkupLine("[dim]OpenTelemetry traces will be written to console[/]");
+        }
         AnsiConsole.WriteLine();
 
         // Create the game with dependencies injected
@@ -43,7 +61,16 @@ class Program
         // Run the game
         game.Play(generations);
 
+        // Force flush to ensure all telemetry is exported
+        tracerProvider?.ForceFlush();
+
         AnsiConsole.MarkupLine("[green]Simulation complete![/]");
+
+        if (enableTracing)
+        {
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[dim]Traces exported above show the complete flow of the game[/]");
+        }
     }
 }
 
