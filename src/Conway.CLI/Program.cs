@@ -1,34 +1,27 @@
 // Author: Ian Cooper
-// Date: 23 November 2025
-// Notes: CLI for Conway's Game of Life using Clean Architecture with OpenTelemetry
+// Date: 24 November 2025
+// Notes: CLI for Conway's Game of Life - now a thin wrapper around the API
 
-using Conway.Core;
-using OpenTelemetry;
-using OpenTelemetry.Resources;
-using OpenTelemetry.Trace;
+using Conway.CLI;
 using Spectre.Console;
-
-namespace Conway.CLI;
+using System.Net.Http.Json;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 class Program
 {
-    static void Main(string[] args)
+    static async Task Main(string[] args)
     {
-        // Set up OpenTelemetry tracing
-        using var tracerProvider = Sdk.CreateTracerProviderBuilder()
-            .SetResourceBuilder(ResourceBuilder.CreateDefault()
-                .AddService(Telemetry.ServiceName, serviceVersion: Telemetry.ServiceVersion))
-            .AddSource(Telemetry.ServiceName)
-            .AddConsoleExporter()
-            .Build();
-
         AnsiConsole.Write(
             new FigletText("Conway's Game of Life")
                 .LeftJustified()
                 .Color(Color.Green));
 
-        AnsiConsole.MarkupLine("[dim]A C# implementation using TDD, Clean Architecture, and OpenTelemetry[/]");
+        AnsiConsole.MarkupLine("[dim]A C# implementation using TDD and Clean Architecture[/]");
         AnsiConsole.WriteLine();
+
+        // Get API URL
+        var apiUrl = AnsiConsole.Ask("Enter the [green]API URL[/]:", "https://localhost:5001");
 
         // Get seed file name
         var seedFile = AnsiConsole.Ask("Enter the [green]seed file[/] path:", "seed.txt");
@@ -42,75 +35,160 @@ class Program
         // Get number of generations
         var generations = AnsiConsole.Ask("How many [green]generations[/] to run?", 3);
 
-        // Ask if tracing should be enabled
-        var enableTracing = AnsiConsole.Confirm("Enable [yellow]OpenTelemetry trace output[/]?", false);
-
         AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[yellow]Starting simulation...[/]");
-        if (enableTracing)
-        {
-            AnsiConsole.MarkupLine("[dim]OpenTelemetry traces will be written to console[/]");
-        }
-        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[yellow]Reading seed file...[/]");
 
-        // Create the game with dependencies injected
+        // Read the seed file
         var reader = new SeedReader(seedFile);
-        var writer = new SpectreConsoleWriter();
-        var game = new Game(reader, writer);
+        var (generation, size, cells) = reader.ReadSeedFile();
 
-        // Run the game
-        game.Play(generations);
+        AnsiConsole.MarkupLine($"[dim]Loaded board: {size.rows}x{size.cols}, generation {generation}[/]");
+        AnsiConsole.WriteLine();
 
-        // Force flush to ensure all telemetry is exported
-        tracerProvider?.ForceFlush();
+        // Display initial board
+        DisplayBoard(cells, new SizeDto { Rows = size.rows, Cols = size.cols }, generation, "Initial State");
 
-        AnsiConsole.MarkupLine("[green]Simulation complete![/]");
-
-        if (enableTracing)
+        // Create request
+        var request = new GameRequest
         {
-            AnsiConsole.WriteLine();
-            AnsiConsole.MarkupLine("[dim]Traces exported above show the complete flow of the game[/]");
+            Generation = generation,
+            Size = new SizeDto { Rows = size.rows, Cols = size.cols },
+            Cells = cells,
+            Runs = generations
+        };
+
+        AnsiConsole.MarkupLine("[yellow]Sending request to API...[/]");
+
+        // Call the API
+        try
+        {
+            using var httpClient = new HttpClient
+            {
+                BaseAddress = new Uri(apiUrl)
+            };
+
+            // Configure JSON options to handle multi-dimensional arrays
+            var options = new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true,
+                Converters = { new MultiDimensionalArrayConverter() }
+            };
+
+            var response = await httpClient.PostAsJsonAsync("/api/game/run", request, options);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var result = await response.Content.ReadFromJsonAsync<GameResponse>(options);
+
+                if (result != null)
+                {
+                    AnsiConsole.MarkupLine("[green]Simulation complete![/]");
+                    AnsiConsole.WriteLine();
+
+                    // Display final board
+                    DisplayBoard(result.Cells, new SizeDto { Rows = result.Size.Rows, Cols = result.Size.Cols },
+                        result.Generation, "Final State");
+                }
+            }
+            else
+            {
+                AnsiConsole.MarkupLine($"[red]API Error: {response.StatusCode}[/]");
+                var errorContent = await response.Content.ReadAsStringAsync();
+                AnsiConsole.MarkupLine($"[red]{errorContent}[/]");
+            }
+        }
+        catch (HttpRequestException ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Connection Error: {ex.Message}[/]");
+            AnsiConsole.MarkupLine("[yellow]Make sure the API is running![/]");
         }
     }
-}
 
-/// <summary>
-/// Writes boards to the console using Spectre.Console for beautiful rendering
-/// </summary>
-class SpectreConsoleWriter : IWriter
-{
-    public void WriteBoard(Board board)
+    static void DisplayBoard(char[,] cells, SizeDto size, int generation, string title)
     {
-        var boardString = board.ToString();
-        var lines = boardString.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-
-        // Display board with Spectre.Console styling
-        var panel = new Panel(RenderBoard(lines))
+        var gridLines = new List<string>();
+        for (int r = 0; r < size.Rows; r++)
         {
-            Header = new PanelHeader(lines[0]),
+            var line = "";
+            for (int c = 0; c < size.Cols; c++)
+            {
+                line += cells[r, c] == '*' ? "[green]█[/] " : "[dim]·[/] ";
+            }
+            gridLines.Add(line.TrimEnd());
+        }
+
+        var panel = new Panel(string.Join("\n", gridLines))
+        {
+            Header = new PanelHeader($"{title} - Generation {generation}"),
             Border = BoxBorder.Rounded,
             BorderStyle = new Style(Color.Cyan1)
         };
 
         AnsiConsole.Write(panel);
         AnsiConsole.WriteLine();
-        Thread.Sleep(500);
     }
+}
 
-    private string RenderBoard(string[] lines)
+/// <summary>
+/// Custom JSON converter for multi-dimensional arrays
+/// </summary>
+public class MultiDimensionalArrayConverter : JsonConverter<char[,]>
+{
+    public override char[,] Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
-        // Skip the generation and size lines, just render the grid
-        var gridLines = new List<string>();
-        for (int i = 2; i < lines.Length; i++)
+        if (reader.TokenType != JsonTokenType.StartArray)
+            throw new JsonException();
+
+        var rows = new List<List<char>>();
+
+        while (reader.Read())
         {
-            var line = "";
-            foreach (var c in lines[i])
+            if (reader.TokenType == JsonTokenType.EndArray)
+                break;
+
+            if (reader.TokenType == JsonTokenType.StartArray)
             {
-                line += c == '*' ? "[green]█[/] " : "[dim]·[/] ";
+                var row = new List<char>();
+                while (reader.Read())
+                {
+                    if (reader.TokenType == JsonTokenType.EndArray)
+                        break;
+
+                    row.Add(reader.GetString()?[0] ?? '.');
+                }
+                rows.Add(row);
             }
-            gridLines.Add(line.TrimEnd());
         }
 
-        return string.Join("\n", gridLines);
+        if (rows.Count == 0)
+            return new char[0, 0];
+
+        var result = new char[rows.Count, rows[0].Count];
+        for (int i = 0; i < rows.Count; i++)
+        {
+            for (int j = 0; j < rows[i].Count; j++)
+            {
+                result[i, j] = rows[i][j];
+            }
+        }
+
+        return result;
+    }
+
+    public override void Write(Utf8JsonWriter writer, char[,] value, JsonSerializerOptions options)
+    {
+        writer.WriteStartArray();
+
+        for (int i = 0; i < value.GetLength(0); i++)
+        {
+            writer.WriteStartArray();
+            for (int j = 0; j < value.GetLength(1); j++)
+            {
+                writer.WriteStringValue(value[i, j].ToString());
+            }
+            writer.WriteEndArray();
+        }
+
+        writer.WriteEndArray();
     }
 }
